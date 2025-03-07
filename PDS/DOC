@@ -1,0 +1,33 @@
+LODCOMPR is a batch program that does side-by-side listings of 2 or 3
+load module libraries (either PDSes or PDSEs), showing member names,
+sizes, and linkedit/bind dates, flagging the ones that don't match.
+(It can also be run specifing only 1 library, which produces a straight
+member list of that library.)
+
+Since it's comparing only the directory information and module sizes,
+not the actual data, it isn't as foolproof as ISPF compare, but it's a
+good way to check the differences between two or three loadlibs.
+TSO tools like STARTOOL, PDS86, File-Aid MVS, and File Manager give
+the same information (and I assume can do so in batch), but I'm not
+aware of any that compare multiple loadlibs.
+
+LODCOMPR is in COBOL, but most of the work is done in an Assembler
+subprogram named LODCMPIO.
+
+Execution JCL:
+//stepname EXEC PGM=LODCOMPR,PARM='FILES=n,LIST=value'
+      FILES is required and must be either 1, 2, or 3.
+      LIST=ALL:  All members of all files are listed.  Exceptions
+         (members that don't match in size/EPA/date/alias, or that are
+         not present in all files) are asterisked.
+      LIST=EXCEPTIONS:  Only exceptions are listed; members present in
+         all files with identical size/EPA/date/alias are omitted.
+      LIST=DUPS:  All members present in more than one file are listed
+         (regardless of whether their size/EPA/date/alias match).
+         Members present in exactly one file are omitted.
+      If LIST is not coded, LIST=EXCEPTIONS is default.
+      If FILES=1, LIST=ALL is forced.
+//INPUT1 DD DSN=...,DISP=SHR
+//INPUT2 DD DSN=...,DISP=SHR   (may be omitted if FILES=1)
+//INPUT3 DD DSN=...,DISP=SHR   (may be omitted if FILES=1 or 2)
+//SYSPRINT DD SYSOUT=class,DCB=RECFM=FA

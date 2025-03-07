@@ -1,0 +1,368 @@
+LODCMPIO CSECT
+LODCMPIO AMODE 31
+LODCMPIO RMODE 24
+*
+* I/O subroutine for LODCOMPR, which is in COBOL.
+* LODCOMPR calls it passing two or three parameter addresses:
+*    1.  File number (1, 2, or 3) - ZL1
+*    2.  Action type - CL5 - "OPEN ", "READ ", or "CLOSE"
+*    3.  I/O buffer area where LODCMPIO returns data from the JFCB (the
+*        OPEN call) and data for each member (the READ call):
+*            a.  DSNAME                       CL44
+*            b.  (First) volser               CL6
+*            c.  Member name                  CL8
+*            d.  Module size                  ZL6
+*            e.  EPA offset                   ZL6
+*            f.  Linkedit date (YYYY.DDD)     CL8
+*            g.  If alias, the primary name   CL8
+*        Items a-b are returned from the OPEN call only.  Items c-g are
+*        returned from the READ call only.  For the CLOSE call, nothing
+*        is returned in the third parameter area.
+* The three input DCBs are in this program.  Easier that way.
+* At EOF, high-values are returned in the member name field (also for
+* any subsequent calls for that file).
+* This subroutine is serially reusable, but not reentrant.  RMODE must
+* be 24 because it contains DCBs.  AMODE is 31.
+*
+* Modified 5/18/2006 to use DESERV rather than reading directory, since
+* that works for both PDSes and PDSEs.  DESERV returns all the member
+* information we need except the link/bind date.
+*
+* Modified 7/17/2006 to use the binder API to retrieve the link/bind
+* date of the member.  For PDSes we formerly did a BSAM READ of the
+* CSECT IDR record, but the API is the only documented method of
+* getting it for PDSEs--and also works for PDS's.
+*
+* Modified 8/7/2006 to use the binder API option INTYPE=SMDE rather
+* than INTYPE=NAME; SMDE is slightly faster but didn't work for PDSes
+* until OA16648.
+*
+* Modified 3/4/2021 to cover case where member has no link/bind date,
+* which is apparently possible for very old linkedits.  Also added code
+* to force BLKSIZE 32760 on the input DCBs to prevent message IEW2541S
+* (which I think is from Fault Analyzer) if the module size exceeds the
+* PDS label's BLKSIZE.  Also went to four-digit years.
+*
+         SAVE  (14,12)
+         LR    R12,R15             Load base register
+         USING LODCMPIO,R12
+         ST    R13,SAVEAREA+4
+         LR    R11,R13
+         LA    R13,SAVEAREA
+         ST    R13,8(,R11)
+         ICM   R2,15,0(R1)         Load first parameter
+         BNZ   *+8
+         BAL   R14,BOMB            First parameter missing
+         ICM   R3,15,4(R1)         Load second parameter
+         BNZ   *+8
+         BAL   R14,BOMB            Second parameter missing
+         CLC   0(5,R3),=C'CLOSE'   If not CLOSE call, load 3rd param
+         BE    CHECKPRM
+         ICM   R4,15,8(R1)         Load third parameter
+         BNZ   *+8
+         BAL   R14,BOMB            Third parameter missing
+         USING IOAREA,R4
+* Verify parameters are good
+CHECKPRM CLI   0(R2),C'1'
+         BNE   CHECK2
+         LA    R5,FIL1AREA
+         B     GOOD1
+CHECK2   CLI   0(R2),C'2'
+         BNE   CHECK3
+         LA    R5,FIL2AREA
+         B     GOOD1
+CHECK3   CLI   0(R2),C'3'
+         BE    *+8
+         BAL   R14,BOMB            First parm (file no.) invalid
+         LA    R5,FIL3AREA
+         USING FILEAREA,R5
+GOOD1    CLC   0(5,R3),=C'OPEN '
+         BE    OPENCALL
+         CLC   0(5,R3),=C'READ '
+         BE    READCALL
+         CLC   0(5,R3),=C'CLOSE'
+         BE    CLOSCALL
+         BAL   R14,BOMB            Second parm (call type) invalid
+***********************************************************************
+* OPEN call
+OPENCALL LA    R6,DCB              Point to DCB
+         USING IHADCB,R6
+         TM    DCBOFLGS,DCBOFOPN   Already open?
+         BO    RETURN              Yes--don't try to do it twice
+         RDJFCB ((R6))             Get the JFCB
+         LTR   R15,R15             RDJFCB successful?
+         BZ    *+8
+         BAL   R14,BOMB            RDJFCB failed
+         LA    R15,JFCBAREA        Area where JFCB was returned
+         USING INFMJFCB,R15
+         MVC   IODSNAME,JFCBDSNM   Pass DSNAME and
+         MVC   IOVOLSER,JFCBVOLS     (1st) volser back to caller
+         MVC   IOMEMBER(34),SPACES  Clear rest of record
+         MVC   JFCBLKSI,=H'32760'  Force OPEN to use BLKSIZE 32760
+         DROP  R15                 Through with JFCB
+         OPEN  ((R6),(INPUT)),TYPE=J  Open the PDS
+         LA    R11,CURRDESB        Area for DESERV to return pointer
+         DESERV FUNC=GET_ALL,AREAPTR=(R11),DCB=(R6),MF=S  Get directory
+         LTR   R15,R15             DESERV successful?
+         BZ    DESERVOK            Yes
+         CLM   R0,3,=Y(DESRS_DIRECTORY_EMPTY)  No members?
+         BE    EMPTY
+         BAL   R14,BOMB            DESERV failed for some other reason
+EMPTY    MVI   EOFSW,X'FF'         PDS/PDSE was empty
+         B     RETURN              Won't need API, just return DSN
+DESERVOK L     R7,CURRDESB         Point to the (first or only) DESB
+         USING DESB,R7
+         CLC   DESB_ID,=CL8'IGWDESB '  Check eyecatcher
+         BE    *+8
+         BAL   R14,BOMB            DESB eyecatcher bad
+         MVC   SMDECTR,DESB_COUNT  Save number of SMDEs in this DESB
+         LA    R8,DESB_DATA        Position to first SMDE
+         USING SMDE,R8
+         CLC   SMDE_ID,=CL8'IGWSMDE '  Check eyecatcher
+         BE    *+8
+         BAL   R14,BOMB            SMDE eyecatcher bad
+         ST    R8,CURRSMDE         Save its address
+         IEWBUFF TYPE=IDRB,FUNC=GETBUF  Get a buffer for API calls
+         ST    IEWBIDB_BASE,APIBUFF  Save its address
+         ST    IDB_BASE,IDBBUFF    Also address of IDB entry within it
+         IEWBUFF TYPE=IDRB,FUNC=INITBUF  Initialize its header
+         MVC   DTOKEN,ZEROS        Zero dialog token
+         IEWBIND FUNC=STARTD,      Start API dialog                    X
+               DIALOG=DTOKEN,RETCODE=RETCODE,RSNCODE=RSNCODE,VERSION=6
+         CLC   RSNCODE,ZEROS       Successful STARTD?
+         BE    *+8
+         BAL   R14,BOMB            STARTD call bad
+         MVC   WKTOKEN,ZEROS       Zero workmod token
+         IEWBIND FUNC=CREATEW,     Create API workmod (read only)      X
+               DIALOG=DTOKEN,WORKMOD=WKTOKEN,INTENT=ACCESS,            X
+               RETCODE=RETCODE,RSNCODE=RSNCODE,VERSION=6
+         CLC   RSNCODE,ZEROS       Successful CREATEW?
+         BE    RETURN
+         BAL   R14,BOMB            CREATEW call bad
+***********************************************************************
+* READ call
+READCALL CLI   EOFSW,X'FF'         Are we already at EOF?
+         BNE   NOTEOF              No--branch
+         MVC   IOMEMBER,=8X'FF'
+         MVC   IOSIZE(26),SPACES   Clear rest of record
+         B     RETURN
+NOTEOF   LA    R6,DCB              Point to DCB
+         L     R7,CURRDESB         Point to (current) DESB
+         L     R8,CURRSMDE         Point to current SMDE
+         L     IEWBIDB_BASE,APIBUFF  Reload the two API buffer
+         L     IDB_BASE,IDBBUFF        pointer registers
+         CLC   SMDE_ID,=CL8'IGWSMDE '  (Re)check eyecatcher
+         BE    *+8
+         BAL   R14,BOMB            SMDE eyecatcher bad
+         MVC   IOMEMBER,SPACES     Pad member name
+         LH    R15,SMDE_NAME_OFF   Offset to directory name section
+         AR    R15,R8              Address of directory name section
+         USING SMDE_NAME,R15
+         LH    R1,SMDE_NAME_LEN    Length of member name
+         CH    R1,=H'8'            Greater than 8? (possible in PDSE)
+         BNH   *+8
+         BAL   R14,BOMB            We can't handle names over 8
+         BCTR  R1,0                -1 for EX
+         EX    R1,MOVENAME         Move member name
+         MVC   IOALIAS,SPACES      Blank out alias field
+         TM    SMDE_FLAG,SMDE_FLAG_ALIAS  Is this an alias?
+         BO    ALIAS               Yes--branch
+         B     GETSIZE
+MOVENAME MVC   IOMEMBER(*-*),SMDE_NAME_VAL  Executed
+         DROP  R15                 Through with SMDE name area DSECT
+ALIAS    LH    R1,SMDE_PNAME_OFF   Offset to primary name area
+         LA    R15,0(R1,R8)        Address of primary name area
+         USING SMDE_NAME,R15
+         LH    R1,SMDE_NAME_LEN    Length of primary name
+         CH    R1,=H'8'            Greater than 8? (possible in PDSE)
+         BNH   *+8
+         BAL   R14,BOMB            Still can't handle names over 8
+         BCTR  R1,0                -1 for EX
+         EX    R1,MOVENAMA         Move primary name (of alias)
+         B     GETSIZE
+MOVENAMA MVC   IOALIAS(*-*),SMDE_NAME_VAL  Executed
+         DROP  R15                 Through with SMDE name DSECT again
+GETSIZE  LH    R15,SMDE_PMAR_OFF   Offset to user data (PMAR base)
+         AR    R15,R8              Address of PMAR base
+         USING PMAR,R15
+         UNPK  WORK(7),PMAR_STOR+1(4)  Module size + 1 extra
+         TR    WORK(6),TRTAB-240   Convert hex to printable
+         MVC   IOSIZE,WORK         Move length to output area
+         UNPK  WORK(7),PMAR_EPA+1(4)  EPA offset + 1 extra
+         TR    WORK(6),TRTAB-240   Convert hex to printable
+         MVC   IOEPA,WORK          Move EPA to output area
+         DROP  R15                 Through with PMAR
+         IEWBIND FUNC=INCLUDE,     Include the member into workmod     X
+               INTYPE=SMDE,DDNAME=INCLDD,DEPTR=CURRSMDE,               X
+               WORKMOD=WKTOKEN,RETCODE=RETCODE,RSNCODE=RSNCODE,        X
+               VERSION=6
+         CLC   RSNCODE,ZEROS       Successful INCLUDE?
+         BNE   NODATE              No--won't be able to get bind date
+         MVC   CURSOR,ZEROS        Zero cursor field
+         IEWBIND FUNC=GETD,        Get IDRB class data for member      X
+               CLASS=CLASS,CURSOR=CURSOR,AREA=IEWBIDB,COUNT=COUNT,     X
+               WORKMOD=WKTOKEN,RETCODE=RETCODE,RSNCODE=RSNCODE,        X
+               VERSION=6
+         CLC   RSNCODE,ZEROS       Successful GETD?
+         BNE   NODATE              No--doesn't have a date
+*          IDB_DATE_BOUND contains bind date YYYYDDD character
+GETDATE  MVC   IODATE(4),IDB_DATE_BOUND  Year
+         MVI   IODATE+4,C'.'
+         MVC   IODATE+5(3),IDB_DATE_BOUND+4  Julian day
+         B     RESETWKM
+NODATE   MVC   IODATE,=C'????????'
+RESETWKM IEWBIND FUNC=RESETW,      Reset workmod for next member       X
+               WORKMOD=WKTOKEN,INTENT=ACCESS,                          X
+               RETCODE=RETCODE,RSNCODE=RSNCODE,VERSION=6
+         CLC   RSNCODE,ZEROS       Successful RESETW?
+         BE    *+8
+         BAL   R14,BOMB            RESETW call bad
+*   Move on to next member, if any
+         L     R1,SMDECTR          Number of SMDEs remaining in DESB
+         BCT   R1,NEXTSMDE         Decrement, branch if there are more
+*          Fall through -- SMDECTR=0 -- go on to next DESB if any
+         ICM   R7,15,DESB_NEXT     Next DESB in chain
+         BZ    EOF                 Branch if no more (end of directory)
+         ST    R7,CURRDESB         Set new current DESB
+         CLC   DESB_ID,=CL8'IGWDESB '  Check eyecatcher
+         BE    *+8
+         BAL   R14,BOMB            DESB eyecatcher bad
+         MVC   SMDECTR,DESB_COUNT  Save number of SMDEs in this DESB
+         LA    R8,DESB_DATA        Position to first SMDE
+         ST    R8,CURRSMDE         Save its address
+         B     RETURN              Return (positioned at next SMDE)
+NEXTSMDE ST    R1,SMDECTR          Save the decremented count
+         A     R8,SMDE_LEN         Bump to next SMDE (next member)
+         ST    R8,CURRSMDE         Save address of next SMDE/member
+         B     RETURN              Return (positioned at next SMDE)
+EOF      MVI   EOFSW,X'FF'
+         B     RETURN              Return the last member
+         DROP  R7,R8               Through with DESB and SMDE dsects
+***********************************************************************
+* CLOSE call
+CLOSCALL LA    R6,DCB              Point to DCB
+         TM    DCBOFLGS,DCBOFOPN   Already closed?
+         BZ    RETURN              Yes--don't try to do it twice
+         CLC   APIBUFF,ZEROS       Did we ever start an API dialog?
+         BE    RETURN              No
+         L     IEWBIDB_BASE,APIBUFF  Reload the two API buffer
+         L     IDB_BASE,IDBBUFF        pointer registers
+         IEWBIND FUNC=DELETEW,     Delete the workmod                  X
+               WORKMOD=WKTOKEN,RETCODE=RETCODE,RSNCODE=RSNCODE,        X
+               VERSION=6
+         CLC   RSNCODE,ZEROS       Successful DELETEW?
+         BE    *+8
+         BAL   R14,BOMB            DELETEW call bad
+         IEWBIND FUNC=ENDD,        End the API dialog                  X
+               DIALOG=DTOKEN,RETCODE=RETCODE,RSNCODE=RSNCODE,VERSION=6
+         CLC   RSNCODE,ZEROS       Successful ENDD?
+         BE    *+8
+         BAL   R14,BOMB            ENDD call bad
+         CLOSE ((R6))              Close the DCB
+         IEWBUFF TYPE=IDRB,FUNC=FREEBUF  Free the API call buffer
+         MVC   APIBUFF,ZEROS       Zero our pointer to it
+         MVC   IDBBUFF,ZEROS         and to the IDB area within it
+         B     RETURN
+***********************************************************************
+RETURN   L     R13,SAVEAREA+4
+         RETURN (14,12),,RC=0
+***********************************************************************
+SAVEAREA DC    18A(0)
+BOMB     DC    F'0'                Intentional S0C1 (debugging)
+*                                    (R14 will show where it came from)
+MSGTXT   WTO   '                                 ',MF=L
+EXLIST   DS    0F                  RDJFCB DCB exit list
+         DC    X'87',AL3(JFCBAREA)
+JFCBAREA DS    0F,176C
+         DS    0F
+WORK     DS    CL7
+SPACES   DC    CL34' '
+ZEROS    DC    XL8'00'
+TRTAB    DC    C'0123456789ABCDEF'  Translate x'FA-FF' to C'A-F'
+         IEWBUFF TYPE=IDRB,FUNC=MAPBUF,SIZE=1,HEADREG=R9,ENTRYREG=R10, X
+               VERSION=6
+RETCODE  DS    F                   Return code from API
+RSNCODE  DS    F                   Reason code from API
+CLASS    DC    H'6',CL6'B_IDRB'    Class of data we want
+CURSOR   DS    F                   Don't understand this one either
+COUNT    DS    F                   Number of classes (?) in buffer
+* Following areas are referred to only via the DSECT (using R5)
+FIL1AREA DS    0F
+         DCB   DDNAME=INPUT1,DSORG=PO,MACRF=R,RECFM=U,EXLST=EXLIST
+         DC    A(0)                CURRDESB
+         DC    A(0)                CURRSMDE
+         DC    F'0'                SMDECTR
+         DC    A(0)                APIBUFF
+         DC    A(0)                IDBBUFF
+         DC    XL8'00'             DTOKEN
+         DC    XL8'00'             WKTOKEN
+         DC    XL2'6',CL6'INPUT1'  INCLDD
+         DC    X'00'               EOFSW
+FIL2AREA DS    0F
+         DCB   DDNAME=INPUT2,DSORG=PO,MACRF=R,RECFM=U,EXLST=EXLIST
+         DC    A(0)                CURRDESB
+         DC    A(0)                CURRSMDE
+         DC    F'0'                SMDECTR
+         DC    A(0)                APIBUFF
+         DC    A(0)                IDBBUFF
+         DC    XL8'00'             DTOKEN
+         DC    XL8'00'             WKTOKEN
+         DC    XL2'6',CL6'INPUT2'  INCLDD
+         DC    X'00'               EOFSW
+FIL3AREA DS    0F
+         DCB   DDNAME=INPUT3,DSORG=PO,MACRF=R,RECFM=U,EXLST=EXLIST
+         DC    A(0)                CURRDESB
+         DC    A(0)                CURRSMDE
+         DC    F'0'                SMDECTR
+         DC    A(0)                APIBUFF
+         DC    A(0)                IDBBUFF
+         DC    XL8'00'             DTOKEN
+         DC    XL8'00'             WKTOKEN
+         DC    XL2'6',CL6'INPUT3'  INCLDD
+         DC    X'00'               EOFSW
+         LTORG
+INMEMBLK DS    0F,CL32760          Member data buffer
+***********************************************************************
+IOAREA   DSECT
+IODSNAME DS    CL44
+IOVOLSER DS    CL6
+IOMEMBER DS    CL8
+IOSIZE   DS    CL6
+IOEPA    DS    CL6
+IODATE   DS    CL8
+IOALIAS  DS    CL8
+FILEAREA DSECT
+DCB      DCB   DSORG=PO,MACRF=R    DCB
+CURRDESB DS    A                   Addr of (current) DESERV area
+CURRSMDE DS    A                   Addr of current SMDE
+SMDECTR  DS    F                   No. of SMDEs remaining in this DESB
+APIBUFF  DS    A                   Address of API buffer
+IDBBUFF  DS    A                   Address of IDB buffer within it
+DTOKEN   DS    XL8                 Dialog token for API
+WKTOKEN  DS    XL8                 Workmod token for API
+INCLDD   DS    CL8                 Length and DDNAME for INCLUDE call
+EOFSW    DS    X                   x'FF' at EOF
+*        PRINT NOGEN
+         IHAPDS PDSBLDL=NO,DSECT=YES
+         IGWDES
+         IGWSMDE
+         DCBD  DSORG=PS
+JFCBDSCT DSECT
+         IEFJFCBN
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         END
